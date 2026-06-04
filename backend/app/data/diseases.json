@@ -1,0 +1,164 @@
+[
+  {
+    "key": "tomato_healthy",
+    "label": "Tomato — Healthy",
+    "severity": "mild",
+    "symptoms": [
+      "No visible lesions or discoloration.",
+      "Leaves are uniformly green with normal venation."
+    ],
+    "treatment": [
+      "Maintain consistent watering at the base to keep foliage dry.",
+      "Rotate crops yearly and avoid overhead irrigation.",
+      "Continue scouting weekly for early signs of disease."
+    ]
+  },
+  {
+    "key": "tomato_early_blight",
+    "label": "Tomato — Early Blight",
+    "severity": "moderate",
+    "symptoms": [
+      "Dark brown spots with concentric rings on lower leaves.",
+      "Yellow halos around lesions, leaves drop prematurely.",
+      "Stem lesions may appear near the soil line."
+    ],
+    "treatment": [
+      "Remove and destroy affected leaves — do not compost.",
+      "Apply a copper-based or chlorothalonil fungicide every 7–10 days.",
+      "Mulch around the base to prevent soil splash onto foliage.",
+      "Rotate away from tomato/potato/eggplant for at least 2 seasons."
+    ]
+  },
+  {
+    "key": "tomato_late_blight",
+    "label": "Tomato — Late Blight",
+    "severity": "severe",
+    "symptoms": [
+      "Irregular water-soaked greyish-green lesions on leaves.",
+      "White fuzzy mold on leaf undersides in humid conditions.",
+      "Rapid collapse of foliage, dark lesions on stems and fruit."
+    ],
+    "treatment": [
+      "Remove severely affected plants to halt spread.",
+      "Spray a protectant fungicide containing mancozeb or copper preventively.",
+      "Avoid overhead watering; improve airflow by staking and pruning.",
+      "Harvest healthy fruit promptly during outbreaks."
+    ]
+  },
+  {
+    "key": "tomato_leaf_mold",
+    "label": "Tomato — Leaf Mold",
+    "severity": "moderate",
+    "symptoms": [
+      "Pale yellow patches on upper leaf surfaces.",
+      "Olive-green to grey fuzzy mold on leaf undersides.",
+      "Leaves curl and drop in severe cases."
+    ],
+    "treatment": [
+      "Lower humidity — improve ventilation in greenhouses.",
+      "Remove infected leaves and avoid overhead watering.",
+      "Apply copper or chlorothalonil fungicide at first signs."
+    ]
+  },
+  {
+    "key": "tomato_bacterial_spot",
+    "label": "Tomato — Bacterial Spot",
+    "severity": "moderate",
+    "symptoms": [
+      "Small dark water-soaked spots on leaves with yellow halos.",
+      "Spots turn angular and may coalesce, defoliating the plant.",
+      "Raised scabby lesions on green fruit."
+    ],
+    "treatment": [
+      "Use certified disease-free seed and transplants.",
+      "Apply copper-based bactericide preventively; add mancozeb for resistance management.",
+      "Avoid working with plants when wet to limit spread."
+    ]
+  },
+  {
+    "key": "potato_healthy",
+    "label": "Potato — Healthy",
+    "severity": "mild",
+    "symptoms": [
+      "Uniform green foliage with no lesions.",
+      "Normal tuber development and canopy growth."
+    ],
+    "treatment": [
+      "Hill soil around stems to protect developing tubers.",
+      "Scout weekly and manage aphids that transmit viruses.",
+      "Use certified seed potatoes next season."
+    ]
+  },
+  {
+    "key": "potato_early_blight",
+    "label": "Potato — Early Blight",
+    "severity": "moderate",
+    "symptoms": [
+      "Bullseye-patterned brown lesions on lower leaves.",
+      "Yellowing around spots; older leaves affected first.",
+      "Sunken dark spots may appear on tubers."
+    ],
+    "treatment": [
+      "Remove infected foliage and destroy crop debris after harvest.",
+      "Apply chlorothalonil or mancozeb fungicide on a 7–10 day schedule.",
+      "Ensure balanced nitrogen — stressed plants are more susceptible."
+    ]
+  },
+  {
+    "key": "potato_late_blight",
+    "label": "Potato — Late Blight",
+    "severity": "severe",
+    "symptoms": [
+      "Dark greasy-looking lesions spreading rapidly on leaves and stems.",
+      "White mold on the underside of leaves in humid weather.",
+      "Reddish-brown firm rot on tubers."
+    ],
+    "treatment": [
+      "Destroy infected plants immediately — including tubers.",
+      "Apply systemic fungicides (e.g. cymoxanil + mancozeb) preventively.",
+      "Plant resistant cultivars and use certified seed."
+    ]
+  },
+  {
+    "key": "apple_scab",
+    "label": "Apple — Scab",
+    "severity": "moderate",
+    "symptoms": [
+      "Olive-green to black velvety lesions on leaves and fruit.",
+      "Infected leaves yellow and drop early.",
+      "Cracked corky spots on fruit surface."
+    ],
+    "treatment": [
+      "Rake and destroy fallen leaves to remove overwintering inoculum.",
+      "Apply fungicides (captan or myclobutanil) from green tip through petal fall.",
+      "Prune for airflow and plant scab-resistant cultivars."
+    ]
+  },
+  {
+    "key": "grape_black_rot",
+    "label": "Grape — Black Rot",
+    "severity": "severe",
+    "symptoms": [
+      "Tan circular lesions on leaves with dark borders.",
+      "Black pinhead fruiting bodies within leaf spots.",
+      "Fruit shrivels into hard black mummies."
+    ],
+    "treatment": [
+      "Remove mummified berries and infected canes during dormancy.",
+      "Apply protectant fungicides (mancozeb, myclobutanil) from bud break until veraison.",
+      "Improve canopy airflow through summer pruning."
+    ]
+  },
+  {
+    "key": "unknown",
+    "label": "Unknown class",
+    "severity": "unknown",
+    "symptoms": [
+      "The system has no detailed notes for this class yet."
+    ],
+    "treatment": [
+      "Consult a local agricultural extension officer for a definitive diagnosis.",
+      "Isolate the plant to prevent potential spread while investigating."
+    ]
+  }
+]

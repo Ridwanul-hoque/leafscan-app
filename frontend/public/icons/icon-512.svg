@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f1c17"/>
+      <stop offset="100%" stop-color="#0b1410"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#8fe0a5"/>
+      <stop offset="100%" stop-color="#1a723b"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#2fb25c" stop-opacity="0.5"/>
+      <stop offset="70%" stop-color="#2fb25c" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="220" fill="url(#glow)"/>
+  <path d="M256 72 C 112 116, 100 376, 256 448 C 412 376, 400 116, 256 72 Z" fill="url(#leaf)" stroke="#bfefca" stroke-width="4"/>
+  <path d="M256 80 L256 440" stroke="#e0f7e5" stroke-opacity="0.8" stroke-width="4"/>
+  <circle cx="200" cy="220" r="14" fill="#f87171"/>
+  <circle cx="308" cy="288" r="14" fill="#f87171"/>
+  <circle cx="220" cy="344" r="11" fill="#fbbf24"/>
+</svg>

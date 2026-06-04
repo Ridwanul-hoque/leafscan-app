@@ -1,0 +1,203 @@
+﻿# ============================================
+# 12) Training History — accuracy at all stages + RU charts
+# ============================================
+import numpy as np
+
+def _hist_series(h, key, fb=None):
+    if h is None or not hasattr(h, "history"):
+        return None
+    d = h.history
+    if key in d:
+        return d[key]
+    if fb and fb in d:
+        return d[fb]
+    return None
+
+def print_stage_metrics(title, h):
+    """Print best / final val_accuracy and train accuracy when present."""
+    va = _hist_series(h, "val_accuracy", "val_acc")
+    ta = _hist_series(h, "accuracy", "acc")
+    print(f"\n=== {title} ===")
+    if va is not None and len(va):
+        print(f"  val_accuracy: best={max(va):.4f}  final={va[-1]:.4f}")
+    else:
+        print("  val_accuracy: (not in history)")
+    if ta is not None and len(ta):
+        print(f"  accuracy:     best={max(ta):.4f}  final={ta[-1]:.4f}")
+    else:
+        print("  accuracy:     (not in history)")
+
+history_teacher_s1 = globals().get("history_teacher_s1", None)
+history_teacher_s2 = globals().get("history_teacher_s2", None)
+history_distill = globals().get("history_distill", None)
+history_student_ft = globals().get("history_student_ft", None)
+
+if all(h is None for h in [history_teacher_s1, history_teacher_s2, history_distill, history_student_ft]):
+    print("[WARN] No training history found in memory.")
+    print("Run the training cell first (the one that starts with setup/config and model.fit calls).")
+
+print_stage_metrics("Phase 1a — Teacher (frozen backbone)", history_teacher_s1)
+print_stage_metrics("Phase 1b — Teacher (backbone fine-tune)", history_teacher_s2)
+print_stage_metrics("Phase 2 — Student distillation", history_distill)
+print_stage_metrics("Phase 3 — Student (backbone fine-tune)", history_student_ft)
+
+def plot_four_stages(histories, titles):
+    """2x2 grid: each subplot is one training stage (local epochs)."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    for ax, h, title in zip(axes.flatten(), histories, titles):
+        if h is None:
+            ax.set_title(title + " (missing)"); ax.axis("off"); continue
+        d = h.history
+        ta = d.get("accuracy") or d.get("acc")
+        va = d.get("val_accuracy") or d.get("val_acc")
+        tl = d.get("loss")
+        vl = d.get("val_loss")
+        n = 0
+        for s in (ta, va, tl, vl):
+            if s is not None:
+                n = max(n, len(s))
+        if n == 0:
+            ax.set_title(title + " (empty)"); ax.axis("off"); continue
+        ep = np.arange(1, n + 1)
+        if ta is not None:
+            ax.plot(ep[:len(ta)], ta, label="train acc", linewidth=2)
+        if va is not None:
+            ax.plot(ep[:len(va)], va, label="val acc", linewidth=2)
+        if tl is not None:
+            ax.plot(ep[:len(tl)], tl, "--", alpha=0.65, label="train loss")
+        if vl is not None:
+            ax.plot(ep[:len(vl)], vl, "--", alpha=0.65, label="val loss")
+        ax.set_title(title)
+        ax.set_xlabel("epoch (within stage)"); ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    plt.tight_layout(); plt.show()
+
+plot_four_stages(
+    [history_teacher_s1, history_teacher_s2, history_distill, history_student_ft],
+    ["1a Teacher frozen BB", "1b Teacher FT", "2 Distillation", "3 Student FT"],
+)
+
+# RU table + charts
+if os.path.exists(RESOURCE_LOG_PATH):
+    df = pd.read_csv(RESOURCE_LOG_PATH).replace([np.inf, -np.inf], np.nan).fillna(0)
+    total_time = df["duration_s"].sum() if "duration_s" in df else np.nan
+    peak_gpu = df["gpu_used_mb"].max() if "gpu_used_mb" in df and df["gpu_used_mb"].notna().any() else np.nan
+    peak_rss = df["proc_rss_mb"].max() if "proc_rss_mb" in df and df["proc_rss_mb"].notna().any() else np.nan
+    avg_ips  = df["throughput_img_s"].mean() if "throughput_img_s" in df and df["throughput_img_s"].notna().any() else np.nan
+
+    print("\n[ResourceUsage SUMMARY]")
+    print(f"  Epochs logged: {len(df)}")
+    if 'TOTAL_EPOCHS' in globals() and len(df) != TOTAL_EPOCHS:
+        print(f"  [WARN] Expected {TOTAL_EPOCHS} epochs in this run. If higher, restart kernel and run all cells once.")
+    print(f"  Total train time: {total_time:.2f}s")
+    print(f"  Avg throughput: {avg_ips:.2f} img/s")
+    print(f"  Peak GPU mem used: {peak_gpu} MB")
+    print(f"  Peak process RSS:  {peak_rss} MB")
+
+    from IPython.display import display
+    display(df)
+
+    if "duration_s" in df:
+        plt.figure(figsize=(7,4)); plt.plot(df["epoch"], df["duration_s"], marker="o")
+        plt.title("Epoch Duration (s)"); plt.xlabel("Epoch"); plt.ylabel("Seconds"); plt.grid(True); plt.show()
+    if "throughput_img_s" in df:
+        plt.figure(figsize=(7,4)); plt.plot(df["epoch"], df["throughput_img_s"], marker="o")
+        plt.title("Throughput (images/sec)"); plt.xlabel("Epoch"); plt.ylabel("img/s"); plt.grid(True); plt.show()
+    if "gpu_used_mb" in df and df["gpu_used_mb"].notna().any():
+        plt.figure(figsize=(7,4)); plt.plot(df["epoch"], df["gpu_used_mb"], marker="o")
+        plt.title("GPU Memory Used (MB)"); plt.xlabel("Epoch"); plt.ylabel("MB"); plt.grid(True); plt.show()
+    if "lr" in df and df["lr"].notna().any():
+        plt.figure(figsize=(7,4)); plt.plot(df["epoch"], df["lr"], marker="o")
+        plt.title("Learning Rate per Epoch"); plt.xlabel("Epoch"); plt.ylabel("LR"); plt.yscale("log"); plt.grid(True); plt.show()
+else:
+    print("[ResourceUsage] Log not found at", RESOURCE_LOG_PATH)
+
+# ============================================
+# 13) Evaluate on test set (no-augment + TTA for higher reported accuracy)
+# ============================================
+if 'model' not in globals() or 'test_flow' not in globals():
+    print("[WARN] Missing `model` or `test_flow` in memory. Run training/data cell first.")
+else:
+    pass
+
+def predict_with_tta(mdl, flow, verbose=1):
+    """Average softmax over original and horizontal flip (no extra training time)."""
+    flow.reset()
+    p0 = mdl.predict(flow, verbose=verbose)
+    flow.reset()
+    chunks = []
+    seen = 0
+    for bx, _ in flow:
+        flipped = np.flip(bx, axis=2).copy()
+        chunks.append(mdl.predict(flipped, verbose=0))
+        seen += len(bx)
+        if seen >= flow.samples:
+            break
+    p1 = np.concatenate(chunks, axis=0)[:flow.samples]
+    return (p0 + p1) / 2.0
+
+test_loss, test_acc = model.evaluate(test_flow, verbose=1)
+print(f"\n[Test] single-pass — loss={test_loss:.4f}  acc={test_acc:.4f}")
+
+y_true = test_flow.classes
+y_prob = predict_with_tta(model, test_flow, verbose=1)
+y_pred = np.argmax(y_prob, axis=1)
+tta_acc = float(np.mean(y_pred == y_true))
+print(f"[Test] TTA (avg orig+hflip) acc={tta_acc:.4f}  (use this for reporting if higher)")
+
+# Predictions & metrics (from TTA probabilities)
+class_names = list(test_flow.class_indices.keys())
+
+print("\nClassification Report:\n")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+from sklearn.metrics import classification_report as cr_dict
+report_dict = cr_dict(y_true, y_pred, target_names=class_names, output_dict=True, zero_division=0)
+report_df = pd.DataFrame(report_dict).transpose().replace([np.inf, -np.inf], np.nan).fillna(0)
+
+from IPython.display import display
+display(report_df.round(3))
+report_df.to_csv(CLASSIF_REPORT_CSV, index=True)
+print(f"[Metrics] Saved detailed report to: {CLASSIF_REPORT_CSV}")
+
+plt.figure(figsize=(8,4))
+plt.bar(class_names, report_df.loc[class_names, "f1-score"])
+plt.ylim(0, 1); plt.ylabel("F1-score"); plt.title("Per-class F1")
+plt.xticks(rotation=45, ha="right"); plt.tight_layout(); plt.show()
+
+# Confusion Matrices
+def plot_conf_mat(cm, classes, normalize=False, title="Confusion Matrix"):
+    if normalize:
+        cm_disp = cm.astype(np.float64)
+        cm_disp = cm_disp / (cm_disp.sum(axis=1, keepdims=True) + 1e-12)
+        fmt = ".2f"
+    else:
+        cm_disp = cm.astype(np.int64)
+        fmt = "d"
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(cm_disp, interpolation='nearest')
+    ax.set_title(title); plt.colorbar(im, ax=ax)
+    ticks = np.arange(len(classes))
+    ax.set_xticks(ticks); ax.set_xticklabels(classes, rotation=90)
+    ax.set_yticks(ticks); ax.set_yticklabels(classes)
+    ax.set_ylabel('True label'); ax.set_xlabel('Predicted label')
+    vmin, vmax = np.nanmin(cm_disp), np.nanmax(cm_disp)
+    thresh = (vmin + vmax) / 2.0
+    for i in range(cm_disp.shape[0]):
+        for j in range(cm_disp.shape[1]):
+            val = cm_disp[i, j]
+            ax.text(j, i, format(val, fmt),
+                    ha="center", va="center",
+                    color="white" if val > thresh else "black", fontsize=10)
+    plt.tight_layout(); plt.show()
+
+cm = confusion_matrix(y_true, y_pred)
+plot_conf_mat(cm, class_names, normalize=False, title="Confusion Matrix (counts)")
+plot_conf_mat(cm, class_names, normalize=True,  title="Confusion Matrix (normalized)")
+
+# ============================================
+# 14) Save final model
+# ============================================
+os.makedirs(os.path.dirname(FINAL_MODEL_PATH), exist_ok=True)
+model.save_weights(FINAL_MODEL_PATH)
+print(f"Final model saved to: {FINAL_MODEL_PATH}")
+

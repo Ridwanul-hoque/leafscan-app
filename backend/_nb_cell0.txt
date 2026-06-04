@@ -1,0 +1,746 @@
+﻿# ============================================
+# 0) Setup — imports & seeds (no pip on Kaggle)
+# ============================================
+import os, sys, math, time, subprocess, warnings
+import numpy as np
+import cv2
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras import layers, models
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def _optional_psutil():
+    try:
+        import psutil
+        return psutil
+    except Exception:
+        return None
+
+psutil = _optional_psutil()  # None if unavailable; ResourceUsageCallback handles None
+
+print("TensorFlow:", tf.__version__)
+SEED = 42
+tf.keras.utils.set_random_seed(SEED)
+np.set_printoptions(suppress=True)
+np.seterr(invalid="ignore")
+pd.options.mode.use_inf_as_na = True
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Friendlier GPU memory behavior
+try:
+    gpus = tf.config.list_physical_devices('GPU')
+    for g in gpus: tf.config.experimental.set_memory_growth(g, True)
+except Exception:
+    pass
+
+# ============================================
+# 1) Kaggle paths
+# ============================================
+DATA_ROOT = "/kaggle/input/datasets/sanowarhossain33/plant-disease-dataset/Dataset"
+TRAIN_DIR = os.path.join(DATA_ROOT, "train")
+VAL_DIR   = os.path.join(DATA_ROOT, "validation")
+TEST_DIR  = os.path.join(DATA_ROOT, "test")
+
+for p in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
+    if not os.path.isdir(p):
+        print(f"[WARN] Missing expected directory: {p}")
+
+# Writeable output locations
+CHECKPOINT_PATH      = os.path.join("/kaggle/working", "models", "hybrid_effnet_mobilenet_distill_best.weights.h5")
+FINAL_MODEL_PATH     = os.path.join("/kaggle/working", "models", "hybrid_effnet_mobilenet_distill_final.weights.h5")
+RESOURCE_LOG_PATH    = "/kaggle/working/resource_log.csv"
+CLASSIF_REPORT_CSV   = "/kaggle/working/classification_report.csv"
+os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
+
+print("DATA_ROOT:", DATA_ROOT)
+print("Checkpoints ->", CHECKPOINT_PATH)
+print("Final model ->", FINAL_MODEL_PATH)
+
+# ============================================
+# 2) Training configuration
+# ============================================
+TARGET_SIZE = (256, 256)
+BATCH_SIZE  = 64  # If GPU memory allows, try 96 for faster epochs (same 25-epoch budget).
+FAST_MODE   = False
+
+# ============================================
+# 3) OpenCV preprocessing pipeline
+# ============================================
+def to_uint8(img):
+    img = np.clip(img, 0, 255)
+    return img.astype(np.uint8)
+
+def gray_world_white_balance(bgr):
+    b,g,r = cv2.split(bgr.astype(np.float32))
+    mb,mg,mr = b.mean()+1e-6, g.mean()+1e-6, r.mean()+1e-6
+    m = (mb+mg+mr)/3.0
+    b *= m/mb; g *= m/mg; r *= m/mr
+    return to_uint8(cv2.merge([b,g,r]))
+
+def clahe_on_v(bgr, clip=3.0, tiles=8):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tiles,tiles))
+    hsv[...,2] = clahe.apply(hsv[...,2])
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+def leaf_mask_hsv(bgr):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask_green = cv2.inRange(hsv, (20,40,40), (90,255,255))
+    mask_red1  = cv2.inRange(hsv, (0,40,40), (10,255,255))
+    mask_red2  = cv2.inRange(hsv, (170,40,40), (180,255,255))
+    mask = cv2.bitwise_or(mask_green, cv2.bitwise_or(mask_red1, mask_red2))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if num > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        mask = np.where(labels==largest, 255, 0).astype(np.uint8)
+    return mask
+
+def compute_indices(bgr):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    r,g,b = rgb[...,0], rgb[...,1], rgb[...,2]
+    eps = 1e-6
+    r1,g1,b1 = r/255., g/255., b/255.
+    exg  = 2*g1 - r1 - b1
+    exr  = 1.4*r1 - g1
+    exgr = exg - exr
+    ndi  = (g1 - r1) / (g1 + r1 + eps)
+    lab  = cv2.cvtColor(to_uint8(rgb), cv2.COLOR_RGB2LAB).astype(np.float32)
+    a    = lab[...,1]
+    def norm255(x):
+        x = x - np.nanmin(x); d = (np.nanmax(x) - np.nanmin(x) + eps)
+        return to_uint8(255*(x/d))
+    return {'exgr': norm255(exgr), 'ndi': norm255(ndi), 'a': norm255(a)}
+
+def lesion_saliency(bgr, leaf_mask):
+    idx = compute_indices(bgr)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    lap  = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+    lapA = to_uint8(np.abs(lap))
+    exgr_inv = to_uint8(255 - idx['exgr'])
+    sal = 0.45*idx['a'] + 0.30*exgr_inv + 0.25*lapA
+    sal = to_uint8(sal)
+    sal = cv2.bitwise_and(sal, sal, mask=leaf_mask)
+    _, binm = cv2.threshold(sal, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    binm = cv2.morphologyEx(binm, cv2.MORPH_OPEN, k, iterations=1)
+    binm = cv2.morphologyEx(binm, cv2.MORPH_CLOSE, k, iterations=2)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binm, 8)
+    keep = np.zeros_like(binm)
+    H,W = binm.shape; min_area = max(30, int(0.0005*H*W))
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep[labels==i] = 255
+    return keep, sal
+
+def apply_mask(bgr, mask):
+    return cv2.bitwise_and(bgr, bgr, mask=mask)
+
+def lesion_aware_crop(bgr, lesion_mask, pad=16):
+    ys, xs = np.where(lesion_mask > 0)
+    if len(xs) == 0:
+        return bgr
+    x1,x2 = xs.min(), xs.max()
+    y1,y2 = ys.min(), ys.max()
+    x1 = max(0, x1-pad); y1 = max(0, y1-pad)
+    x2 = min(bgr.shape[1]-1, x2+pad); y2 = min(bgr.shape[0]-1, y2+pad)
+    return bgr[y1:y2+1, x1:x2+1]
+
+def preprocess_plant_image(img, resize_to=None):
+    """Preprocess RGB image and return RGB image tensor of fixed size TARGET_SIZE."""
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    wb  = gray_world_white_balance(bgr)
+    enh = clahe_on_v(wb, clip=3.0, tiles=8)
+    if FAST_MODE:
+        out_bgr = enh
+    else:
+        leaf = leaf_mask_hsv(wb)
+        plant = apply_mask(enh, leaf)
+        lesion_mask, _ = lesion_saliency(plant, leaf)
+        out_bgr = lesion_aware_crop(plant, lesion_mask)
+    rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(rgb, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+    return rgb
+
+# ============================================
+# 4) Custom Generator to Handle Corrupted Images
+# ============================================
+def custom_generator(directory, batch_size=BATCH_SIZE, target_size=(256, 256), shuffle=True,
+                     augment=False, sample_weight_map=None):
+    if augment:
+        datagen = ImageDataGenerator(
+            preprocessing_function=preprocess_plant_image,
+            rotation_range=20, width_shift_range=0.1, height_shift_range=0.1,
+            shear_range=0.1, zoom_range=0.15, horizontal_flip=True, fill_mode='nearest'
+        )
+    else:
+        datagen = ImageDataGenerator(preprocessing_function=preprocess_plant_image)
+
+    generator = datagen.flow_from_directory(
+        directory, target_size=target_size, batch_size=BATCH_SIZE,
+        class_mode='categorical', shuffle=shuffle
+    )
+
+    while True:
+        try:
+            batch_x, batch_y = next(generator)
+        except Exception as e:
+            print(f"⚠️ Skipping a corrupted batch: {e}")
+            continue
+
+        valid_x, valid_y, weights = [], [], []
+        for i in range(len(batch_x)):
+            try:
+                if batch_x[i] is not None and batch_x[i].ndim == 3:
+                    valid_x.append(batch_x[i]); valid_y.append(batch_y[i])
+                    if sample_weight_map is not None:
+                        cls_idx = int(np.argmax(batch_y[i]))
+                        weights.append(float(sample_weight_map.get(cls_idx, 1.0)))
+                else:
+                    print(f"⚠️ Skipping invalid image at index {i}")
+            except Exception as e:
+                print(f"⚠️ Error processing image at index {i}: {e}")
+
+        if valid_x:
+            if sample_weight_map is not None:
+                yield np.array(valid_x), np.array(valid_y), np.array(weights, dtype=np.float32)
+            else:
+                yield np.array(valid_x), np.array(valid_y)
+        else:
+            print("⚠️ No valid images in this batch. Skipping...")
+
+# ============================================
+# 5) Data Validation and Statistics
+# ============================================
+def validate_dataset(directory, max_samples=1000, quick=True):
+    print(f"Validating dataset in: {directory}")
+    datagen = ImageDataGenerator(preprocessing_function=preprocess_plant_image)
+    it = datagen.flow_from_directory(
+        directory, target_size=TARGET_SIZE, batch_size=BATCH_SIZE,
+        class_mode='categorical', shuffle=False
+    )
+    index_to_class = {v: k for k, v in it.class_indices.items()}
+
+    if quick:
+        from collections import Counter
+        counts_idx = Counter(it.classes)
+        class_counts = {index_to_class[i]: int(c) for i, c in counts_idx.items()}
+        valid_files = int(sum(counts_idx.values()))
+        corrupted_files = []
+        print("Quick validation (no image reads).")
+        print(f"\nDataset Statistics:")
+        print(f"Valid files: {valid_files}")
+        print(f"Corrupted files: 0")
+        print(f"Class distribution:")
+        for class_name in it.class_indices.keys():
+            print(f"  {class_name}: {class_counts.get(class_name, 0)}")
+        return class_counts, corrupted_files
+
+    class_counts = {name: 0 for name in it.class_indices.keys()}
+    corrupted_files, valid_files = [], 0
+
+    files_by_class = {name: [] for name in it.class_indices.keys()}
+    for filepath, cls_idx in zip(it.filenames, it.classes):
+        files_by_class[index_to_class[int(cls_idx)]].append(filepath)
+
+    for class_name, file_list in files_by_class.items():
+        for rel_path in file_list[:max_samples]:
+            file_path = os.path.join(it.directory, rel_path)
+            try:
+                img = cv2.imread(file_path)
+                if img is not None and img.ndim == 3:
+                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    processed = preprocess_plant_image(rgb, resize_to=TARGET_SIZE)
+                    if processed is not None and processed.ndim == 3:
+                        class_counts[class_name] += 1; valid_files += 1
+                    else:
+                        corrupted_files.append(file_path)
+                else:
+                    corrupted_files.append(file_path)
+            except Exception as e:
+                corrupted_files.append(file_path)
+                print(f"Error processing {file_path}: {e}")
+
+    print(f"\nDataset Statistics:")
+    print(f"Valid files: {valid_files}")
+    print(f"Corrupted files: {len(corrupted_files)}")
+    print(f"Class distribution:")
+    for class_name, count in class_counts.items():
+        print(f"  {class_name}: {count}")
+
+    if corrupted_files:
+        print(f"\nFirst 10 corrupted files:")
+        for file_path in corrupted_files[:10]:
+            print(f"  {file_path}")
+
+    return class_counts, corrupted_files
+
+# Validate all datasets
+print("="*50); print("TRAINING SET VALIDATION"); print("="*50)
+train_stats, train_corrupted = validate_dataset(TRAIN_DIR)
+print("\n" + "="*50); print("VALIDATION SET VALIDATION"); print("="*50)
+val_stats, val_corrupted = validate_dataset(VAL_DIR)
+print("\n" + "="*50); print("TEST SET VALIDATION"); print("="*50)
+test_stats, test_corrupted = validate_dataset(TEST_DIR)
+
+# ============================================
+# 6) Data Generators + class weights
+# ============================================
+from collections import Counter
+
+train_flow_for_stats = ImageDataGenerator(preprocessing_function=preprocess_plant_image).flow_from_directory(
+    TRAIN_DIR, target_size=TARGET_SIZE, batch_size=BATCH_SIZE, class_mode='categorical', shuffle=False
+)
+val_flow_for_stats = ImageDataGenerator(preprocessing_function=preprocess_plant_image).flow_from_directory(
+    VAL_DIR, target_size=TARGET_SIZE, batch_size=BATCH_SIZE, class_mode='categorical', shuffle=False
+)
+
+class_indices = train_flow_for_stats.class_indices
+index_to_class = {v: k for k, v in class_indices.items()}
+
+counts = Counter(train_flow_for_stats.classes)
+num_samples = sum(counts.values())
+num_classes = len(counts)
+
+class_weight = {int(cls_idx): (num_samples / (num_classes * max(1, int(cls_count))))
+                for cls_idx, cls_count in counts.items()}
+
+print("Class indices:", class_indices)
+print("Class counts:", dict(counts))
+print("Class weights:", class_weight)
+
+train_gen = custom_generator(TRAIN_DIR, batch_size=BATCH_SIZE, target_size=TARGET_SIZE,
+                             shuffle=True, augment=True, sample_weight_map=class_weight)
+val_gen   = custom_generator(VAL_DIR,   batch_size=BATCH_SIZE, target_size=TARGET_SIZE,
+                             shuffle=False, augment=False)
+
+test_datagen = ImageDataGenerator(preprocessing_function=preprocess_plant_image)
+test_flow = test_datagen.flow_from_directory(
+    TEST_DIR, target_size=TARGET_SIZE, batch_size=BATCH_SIZE, class_mode='categorical', shuffle=False
+)
+
+# ============================================
+# 7) ResourceUsageCallback + LR logging
+# ============================================
+class ResourceUsageCallback(tf.keras.callbacks.Callback):
+    """Logs time/CPU/RAM/GPU usage and LR each epoch to CSV and prints a one-liner."""
+    def __init__(self, steps_per_epoch, batch_size, csv_path=RESOURCE_LOG_PATH, append=True):
+        super().__init__()
+        self.steps_per_epoch = steps_per_epoch
+        self.batch_size = batch_size
+        self.csv_path = csv_path
+        self.append = append
+        self.rows = []
+        self.proc = psutil.Process(os.getpid()) if psutil else None
+
+    def _gpu_mem_mb(self):
+        try:
+            info = tf.config.experimental.get_memory_info('GPU:0')
+            used_mb = info.get('current', 0) / (1024**2)
+            peak_mb = info.get('peak', 0) / (1024**2)
+            return round(used_mb, 1), round(peak_mb, 1)
+        except Exception:
+            pass
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"]
+            ).decode("utf-8").strip().splitlines()[0]
+            used, total = [float(x) for x in out.split(",")]
+            return round(used, 1), round(used, 1)
+        except Exception:
+            return None, None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch_start = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        dur_s = time.time() - self.epoch_start
+
+        lr_now = _current_lr(self.model.optimizer)
+        if lr_now is None and logs is not None and "lr" in logs:
+            try:
+                lr_now = float(logs["lr"])
+            except Exception:
+                pass
+
+        sys_ram_used_mb = sys_ram_pct = proc_rss_mb = cpu_pct = None
+        if psutil:
+            vm = psutil.virtual_memory()
+            sys_ram_used_mb = round(vm.used / (1024**2), 1)
+            sys_ram_pct = vm.percent
+            proc_rss_mb = round(self.proc.memory_info().rss / (1024**2), 1)
+            cpu_pct = psutil.cpu_percent(interval=0.1)
+        gpu_used_mb, gpu_peak_mb = self._gpu_mem_mb()
+
+        imgs = self.steps_per_epoch * self.batch_size
+        ips = round(imgs / dur_s, 2) if dur_s > 0 else None
+
+        row = {
+            "epoch": epoch + 1,
+            "duration_s": round(dur_s, 3),
+            "throughput_img_s": ips,
+            "gpu_used_mb": gpu_used_mb,
+            "gpu_peak_mb": gpu_peak_mb,
+            "proc_rss_mb": proc_rss_mb,
+            "sys_ram_used_mb": sys_ram_used_mb,
+            "sys_ram_pct": sys_ram_pct,
+            "cpu_pct": cpu_pct,
+            "lr": lr_now
+        }
+        if logs:
+            for k in ["loss", "accuracy", "val_loss", "val_accuracy"]:
+                if k in logs:
+                    row[k] = float(logs[k])
+        self.rows.append(row)
+
+        print(f"[RU] epoch {epoch+1}: {dur_s:.1f}s | ips={ips} | LR={lr_now} | "
+              f"GPU={gpu_used_mb}MB (peak {gpu_peak_mb}MB) | RSS={proc_rss_mb}MB | "
+              f"RAM={sys_ram_used_mb}MB {sys_ram_pct}% | CPU={cpu_pct}%")
+
+    def on_train_end(self, logs=None):
+        df = pd.DataFrame(self.rows)
+        if self.append and os.path.exists(self.csv_path):
+            df.to_csv(self.csv_path, mode="a", header=False, index=False)
+        else:
+            df.to_csv(self.csv_path, index=False)
+        print(f"[RU] wrote {len(df)} rows -> {self.csv_path}")
+
+# ---- Safe LR helpers (robust to schedules/strings/tensors) ----
+def _unwrap_optimizer(opt):
+    while True:
+        if hasattr(opt, "inner_optimizer") and getattr(opt, "inner_optimizer") is not None:
+            opt = opt.inner_optimizer; continue
+        if hasattr(opt, "optimizer") and getattr(opt, "optimizer") is not None:
+            opt = opt.optimizer; continue
+        break
+    return opt
+
+def _get_lr_attr(opt):
+    if hasattr(opt, "learning_rate"):
+        return opt.learning_rate, "learning_rate"
+    if hasattr(opt, "lr"):
+        return opt.lr, "lr"
+    return None, None
+
+def _current_lr(opt):
+    opt = _unwrap_optimizer(opt)
+    lr_attr, _ = _get_lr_attr(opt)
+    try:
+        # Schedule
+        if isinstance(lr_attr, tf.keras.optimizers.schedules.LearningRateSchedule):
+            val = lr_attr(opt.iterations)
+            return float(tf.keras.backend.get_value(val))
+        # Callable
+        if callable(lr_attr) and not tf.is_tensor(lr_attr):
+            v = lr_attr()
+            return float(tf.keras.backend.get_value(v)) if tf.is_tensor(v) else float(v)
+        # Tensor/Variable
+        if tf.is_tensor(lr_attr):
+            return float(tf.keras.backend.get_value(lr_attr))
+        if hasattr(lr_attr, "numpy"):
+            return float(lr_attr.numpy())
+        # Plain value / str
+        try:
+            return float(lr_attr)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+class LrLogger(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None: logs = {}
+        lr_now = _current_lr(self.model.optimizer)
+        if lr_now is not None:
+            logs["lr"] = lr_now
+
+# ============================================
+# 8) Hybrid: EfficientNetV2-S -> MobileNetV2 Knowledge Distillation
+# ============================================
+# Phase 1a: Teacher head (frozen backbone). Phase 1b: Fine-tune teacher backbone.
+# Phase 2: Distill to MobileNetV2 (CE+KL, with accuracy logged).
+# Phase 3: Fine-tune student MobileNet backbone (last ~35% layers).
+from tensorflow.keras import mixed_precision
+try:
+    mixed_precision.set_global_policy('float32')
+except Exception:
+    pass
+from tensorflow.keras.applications import EfficientNetV2S, MobileNetV2
+
+def build_teacher_efficientnet(input_shape=(256, 256, 3), num_classes=3, dropout=0.4):
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Rescaling(1.0 / 255)(inputs)
+    try:
+        backbone = EfficientNetV2S(
+            include_top=False, weights='imagenet',
+            input_shape=input_shape, include_preprocessing=False
+        )
+    except TypeError:
+        backbone = EfficientNetV2S(
+            include_top=False, weights='imagenet', input_shape=input_shape
+        )
+    backbone.trainable = False
+    x = backbone(x, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(dropout)(x)
+    outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+    m = models.Model(inputs=inputs, outputs=outputs, name="teacher_efficientnetv2s")
+    m._backbone_name = backbone.name
+    return m
+
+def build_student_mobilenet(input_shape=(256, 256, 3), num_classes=3, alpha=1.0, dropout=0.4):
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Rescaling(1.0 / 127.5, offset=-1)(inputs)
+    backbone = MobileNetV2(
+        include_top=False, weights='imagenet',
+        input_shape=input_shape, alpha=alpha
+    )
+    backbone.trainable = True
+    x = backbone(x, training=True)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(dropout)(x)
+    outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+    m = models.Model(inputs=inputs, outputs=outputs, name="student_mobilenetv2")
+    m._backbone_name = backbone.name
+    return m
+
+num_classes = len(train_flow_for_stats.class_indices)
+
+# Epoch budget: EfficientNet teacher steps dominate wall time (Kaggle ~12h session limit).
+# Keep teacher short; invest epochs in distillation + student (MobileNet is much faster/step).
+EPOCHS_TEACHER_S1 = 4
+EPOCHS_TEACHER_S2 = 2
+EPOCHS_DISTILL = 12
+EPOCHS_STUDENT_FT = 7
+TOTAL_EPOCHS = EPOCHS_TEACHER_S1 + EPOCHS_TEACHER_S2 + EPOCHS_DISTILL + EPOCHS_STUDENT_FT
+assert TOTAL_EPOCHS == 25, f"Expected total epochs=25, got {TOTAL_EPOCHS}"
+print(f"[Config] Total planned epochs = {TOTAL_EPOCHS}")
+LABEL_SMOOTHING = 0.08
+
+# Phase 1a: Teacher — frozen backbone + head
+print("Phase 1a: EfficientNetV2-S teacher (frozen backbone + head)...")
+teacher = build_teacher_efficientnet(input_shape=(*TARGET_SIZE, 3), num_classes=num_classes, dropout=0.4)
+teacher.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-3),
+    loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+    metrics=["accuracy"],
+)
+# 9) Callbacks
+# ============================================
+steps_per_epoch_train = math.ceil(train_flow_for_stats.samples / BATCH_SIZE)
+validation_steps_val  = math.ceil(val_flow_for_stats.samples / BATCH_SIZE)
+
+# Keep RU summary scoped to this run only.
+if os.path.exists(RESOURCE_LOG_PATH):
+    os.remove(RESOURCE_LOG_PATH)
+
+ru_cb = ResourceUsageCallback(steps_per_epoch=steps_per_epoch_train, batch_size=BATCH_SIZE,
+                              csv_path=RESOURCE_LOG_PATH, append=False)
+
+callbacks = [
+    # Keep full epoch budget; best validation weights are still recovered by ModelCheckpoint.
+    tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
+    LrLogger(),
+    tf.keras.callbacks.ModelCheckpoint(CHECKPOINT_PATH, monitor='val_loss', save_best_only=True, save_weights_only=True, verbose=1),
+    ru_cb
+]
+
+def set_optimizer_lr(opt, lr):
+    """Robust LR setter (EfficientNet stage-2 style; works with mixed-precision wrappers)."""
+    opt = _unwrap_optimizer(opt)
+    lr_attr, attr_name = _get_lr_attr(opt)
+    if attr_name is None:
+        raise AttributeError("Optimizer has no learning_rate / lr attribute.")
+    try:
+        if hasattr(lr_attr, "assign"):
+            lr_attr.assign(lr); return
+        if isinstance(lr_attr, tf.keras.optimizers.schedules.LearningRateSchedule) or tf.is_tensor(lr_attr):
+            setattr(opt, attr_name, float(lr)); return
+        try:
+            _ = float(lr_attr)
+            setattr(opt, attr_name, float(lr)); return
+        except Exception:
+            setattr(opt, attr_name, float(lr)); return
+    except Exception:
+        try:
+            opt.learning_rate = float(lr); return
+        except Exception:
+            opt.lr = float(lr)
+
+# ============================================
+history_teacher_s1 = teacher.fit(
+    train_gen, validation_data=val_gen, epochs=EPOCHS_TEACHER_S1,
+    steps_per_epoch=steps_per_epoch_train, validation_steps=validation_steps_val,
+    callbacks=callbacks, verbose=1
+)
+
+# Phase 1b: Fine-tune teacher backbone (stronger teacher → better distillation)
+print("Phase 1b: Fine-tuning EfficientNetV2-S teacher backbone...")
+def find_teacher_backbone(m):
+    if hasattr(m, "_backbone_name"):
+        try:
+            return m.get_layer(m._backbone_name)
+        except Exception:
+            pass
+    for candidate in ["efficientnetv2-s", "efficientnetv2s"]:
+        try:
+            return m.get_layer(candidate)
+        except Exception:
+            continue
+    for lyr in m.layers:
+        if isinstance(lyr, tf.keras.Model) and "efficientnetv2" in lyr.name:
+            return lyr
+    raise ValueError("Teacher backbone (EfficientNetV2S) not found.")
+
+_tb = find_teacher_backbone(teacher)
+# Partial backbone FT only (faster backward than full unfreeze; fits long Kaggle jobs)
+_nbl = len(_tb.layers)
+_k_ft = max(8, int(_nbl * 0.28))
+for _i, _lyr in enumerate(_tb.layers):
+    if _i < _nbl - _k_ft:
+        _lyr.trainable = False
+    elif isinstance(_lyr, layers.BatchNormalization):
+        _lyr.trainable = False
+    else:
+        _lyr.trainable = True
+_tb.trainable = True
+set_optimizer_lr(teacher.optimizer, 1e-4)
+history_teacher_s2 = teacher.fit(
+    train_gen, validation_data=val_gen, epochs=EPOCHS_TEACHER_S2,
+    steps_per_epoch=steps_per_epoch_train, validation_steps=validation_steps_val,
+    callbacks=callbacks, verbose=1
+)
+teacher.save_weights(os.path.join("/kaggle/working/models", "distill_teacher_efficientnetv2s.weights.h5"))
+
+# Phase 2: Distill to MobileNetV2 student
+print("Phase 2: MobileNetV2 student — knowledge distillation...")
+teacher.trainable = False
+student = build_student_mobilenet(input_shape=(*TARGET_SIZE, 3), num_classes=num_classes, alpha=1.0, dropout=0.4)
+
+T = 4.0  # temperature
+alpha = 0.5  # CE vs KL weight (balanced hard labels + teacher soft targets)
+
+# Distillation: KL + CE; log accuracy via Keras metrics (Keras 3)
+def _kl_per_example(p, q, eps=1e-7):
+    p = tf.clip_by_value(p, eps, 1.0)
+    q = tf.clip_by_value(q, eps, 1.0)
+    return tf.reduce_sum(p * (tf.math.log(p) - tf.math.log(q)), axis=-1)
+
+class DistillationModel(tf.keras.Model):
+    def __init__(self, student, teacher, T=4.0, alpha=0.5):
+        super().__init__()
+        self.student = student
+        self.teacher = teacher
+        self.T = T
+        self.alpha = alpha
+        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
+        self.accuracy_tracker = tf.keras.metrics.CategoricalAccuracy(name="accuracy")
+
+    @property
+    def metrics(self):
+        return [self.loss_tracker, self.accuracy_tracker]
+
+    def call(self, x, training=False):
+        return self.student(x, training=training)
+
+    def train_step(self, data):
+        if isinstance(data, (tuple, list)) and len(data) == 3:
+            x, y, sw = data
+        else:
+            x, y = data
+            sw = None
+        with tf.GradientTape() as tape:
+            teacher_logits = self.teacher(x, training=False)
+            student_logits = self.student(x, training=True)
+            ce_fn = tf.keras.losses.CategoricalCrossentropy(reduction='none', label_smoothing=LABEL_SMOOTHING)
+            ce_per = ce_fn(y, student_logits)
+            p_t = tf.nn.softmax(teacher_logits / self.T)
+            q_s = tf.nn.softmax(student_logits / self.T)
+            kl_per = _kl_per_example(p_t, q_s) * (self.T ** 2)
+            per = self.alpha * ce_per + (1 - self.alpha) * kl_per
+            if sw is not None:
+                sw = tf.cast(tf.reshape(sw, [-1]), tf.float32)
+                wsum = tf.reduce_sum(sw) + 1e-8
+                loss = tf.reduce_sum(per * sw) / wsum
+                ce = tf.reduce_sum(ce_per * sw) / wsum
+                kl = tf.reduce_sum(kl_per * sw) / wsum
+            else:
+                loss = tf.reduce_mean(per)
+                ce = tf.reduce_mean(ce_per)
+                kl = tf.reduce_mean(kl_per)
+        grads = tape.gradient(loss, self.student.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.student.trainable_variables))
+        self.loss_tracker.update_state(loss)
+        if sw is not None:
+            self.accuracy_tracker.update_state(y, student_logits, sample_weight=tf.reshape(sw, [-1]))
+        else:
+            self.accuracy_tracker.update_state(y, student_logits)
+        return {
+            "loss": self.loss_tracker.result(),
+            "accuracy": self.accuracy_tracker.result(),
+            "ce_loss": ce,
+            "kl_loss": kl,
+        }
+
+    def test_step(self, data):
+        if isinstance(data, (tuple, list)) and len(data) == 3:
+            x, y, _ = data
+        else:
+            x, y = data
+        y_pred = self.student(x, training=False)
+        loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y, y_pred))
+        self.loss_tracker.update_state(loss)
+        self.accuracy_tracker.update_state(y, y_pred)
+        return {"loss": self.loss_tracker.result(), "accuracy": self.accuracy_tracker.result()}
+
+model = DistillationModel(student, teacher, T=T, alpha=alpha)
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-4))
+# Keras 3: ModelCheckpoint(save_weights_only) requires the model to be built first
+_ = model(tf.zeros((1, *TARGET_SIZE, 3)), training=False)
+history_distill = model.fit(
+    train_gen, validation_data=val_gen, epochs=EPOCHS_DISTILL,
+    steps_per_epoch=steps_per_epoch_train, validation_steps=validation_steps_val,
+    callbacks=callbacks, verbose=1
+)
+
+model = student
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-4),
+    loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+    metrics=["accuracy"],
+)
+
+# Phase 3: Fine-tune student backbone (MobileNet — last ~35% layers, same idea as mobilenet-v2 notebook)
+print("Phase 3: Fine-tuning MobileNetV2 student backbone...")
+try:
+    sb = model.get_layer(model._backbone_name)
+except Exception:
+    sb = None
+    for lyr in model.layers:
+        if isinstance(lyr, tf.keras.Model) and "mobilenetv2" in lyr.name.lower():
+            sb = lyr
+            break
+    if sb is None:
+        raise ValueError("Student backbone (MobileNetV2) not found.")
+_nsl = len(sb.layers)
+_kuf = max(20, int(_nsl * 0.35))
+for _layer in sb.layers[:_nsl - _kuf]:
+    _layer.trainable = False
+for _layer in sb.layers[_nsl - _kuf:]:
+    if not isinstance(_layer, layers.BatchNormalization):
+        _layer.trainable = True
+set_optimizer_lr(model.optimizer, 1e-4)
+history_student_ft = model.fit(
+    train_gen, validation_data=val_gen, epochs=EPOCHS_STUDENT_FT,
+    steps_per_epoch=steps_per_epoch_train, validation_steps=validation_steps_val,
+    callbacks=callbacks, verbose=1
+)
+

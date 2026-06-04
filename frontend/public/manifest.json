@@ -1,0 +1,26 @@
+{
+  "name": "LeafScan — AI Plant Disease Detection",
+  "short_name": "LeafScan",
+  "description": "Instant AI-powered plant disease detection from photos or live camera.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0b1410",
+  "theme_color": "#0b1410",
+  "categories": ["productivity", "utilities", "education"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
