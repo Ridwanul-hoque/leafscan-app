@@ -27,7 +27,7 @@ COPY app ./app
 # Optional: bake the weights into the image. Skip this line if you'd rather
 # mount the file at runtime (see README "Cloud deployment" section).
 # Comment this back in when you've placed the file under backend/models/.
-# COPY models ./models
+COPY models ./models
 
 # Non-root user for safety.
 RUN useradd --create-home --uid 10001 leafscan \
